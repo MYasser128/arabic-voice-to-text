@@ -14,6 +14,20 @@ const clearBtn = document.getElementById("clearBtn");
 let micAvailable = false;
 let finalTranscript = "";
 let userWantsListening = false;
+let restartTimeout = null;
+const RECOVERABLE_ERRORS = new Set([
+  "network",
+  "no-speech",
+  "audio-capture",
+  "service-not-allowed",
+]);
+
+function scheduleRestart(delayMs = 100) {
+  if (!userWantsListening) return;
+
+  clearTimeout(restartTimeout);
+  restartTimeout = setTimeout(() => resumeListeningIfNeeded(), delayMs);
+}
 
 const SpeechRecognitionAPI =
   window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -24,15 +38,11 @@ const speechState = {
   recognition: null,
 };
 
-function initSpeechRecognition() {
-  if (!speechState.browserSupportsSpeechRecognition) return;
-
-  speechState.recognition = new SpeechRecognitionAPI();
-  const recognition = speechState.recognition;
-
+function attachRecognitionHandlers(recognition) {
   recognition.continuous = true;
   recognition.interimResults = true;
   recognition.maxAlternatives = 1;
+  recognition.lang = LANGUAGE;
 
   recognition.onresult = (event) => {
     let interim = "";
@@ -59,24 +69,52 @@ function initSpeechRecognition() {
       speechState.listening = false;
       micStatus.textContent = "تم رفض إذن الميكروفون";
       updateMicUI();
-    } else if (event.error !== "aborted" && event.error !== "no-speech") {
-      micStatus.textContent = "حدث خطأ في التعرف على الصوت";
+    } else if (event.error !== "aborted") {
+      if (RECOVERABLE_ERRORS.has(event.error)) {
+        // Keep listening; onend usually follows, but schedule a backup restart.
+        scheduleRestart(200);
+      } else {
+        micStatus.textContent = "حدث خطأ في التعرف على الصوت";
+      }
     }
   };
 
+  // Browsers end recognition after each phrase even with continuous=true.
+  // Loop: every onend schedules another start until the user clicks stop.
   recognition.onend = () => {
-    if (userWantsListening) {
-      try {
-        recognition.start();
-      } catch (err) {
-        console.error(err);
-      }
+    if (!userWantsListening) {
+      speechState.listening = false;
+      updateMicUI();
       return;
     }
 
-    speechState.listening = false;
-    updateMicUI();
+    scheduleRestart(100);
   };
+}
+
+function createRecognition() {
+  const recognition = new SpeechRecognitionAPI();
+  attachRecognitionHandlers(recognition);
+  return recognition;
+}
+
+function resumeListeningIfNeeded() {
+  if (!userWantsListening) return;
+
+  // Chrome often stops working after the first session on the same object.
+  speechState.recognition = createRecognition();
+
+  try {
+    speechState.recognition.start();
+  } catch (err) {
+    console.warn("Speech recognition restart failed, retrying:", err);
+    scheduleRestart(300);
+  }
+}
+
+function initSpeechRecognition() {
+  if (!speechState.browserSupportsSpeechRecognition) return;
+  speechState.recognition = createRecognition();
 }
 
 function startListening() {
@@ -89,7 +127,8 @@ function startListening() {
 
   userWantsListening = true;
   speechState.listening = true;
-  speechState.recognition.lang = LANGUAGE;
+  clearTimeout(restartTimeout);
+  speechState.recognition = createRecognition();
   updateMicUI();
 
   try {
@@ -105,6 +144,7 @@ function startListening() {
 function stopListening() {
   userWantsListening = false;
   speechState.listening = false;
+  clearTimeout(restartTimeout);
 
   if (speechState.recognition) {
     speechState.recognition.stop();
